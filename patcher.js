@@ -13,6 +13,7 @@ const crypto = require('crypto');
 const {execSync} = require('child_process');
 const {loadManifest, buildPlan, schedule} = require('./plan.js');
 const gui = require('./gui.js');
+const {verifyFiles} = require('./verification.js');
 
 // as a single .exe, keep state next to the exe
 const HERE = require('node:sea').isSea() ? path.dirname(process.execPath) : __dirname;
@@ -34,6 +35,11 @@ const log = (...a) => {
 	console.log(new Date().toLocaleTimeString(), ...a);
 	debug.write('message', {message: a.join(' ')});
 	gui.set({message: a.join(' ')});
+};
+const verificationLog = message => {
+	console.log(new Date().toLocaleTimeString(), message);
+	debug.write('message', {message});
+	gui.setVerification({message});
 };
 
 function findSteam() {
@@ -151,7 +157,9 @@ function progress(label, total) {
 			last = now;
 			const rate = doneBytes / Math.max(1, (now - start) / 1000);
 			const eta = rate > 0 ? Math.round((total - doneBytes) / rate / 60) : '?';
-			log(`${label}: ${gib(doneBytes)} / ${gib(total)} (${(100 * doneBytes / total).toFixed(1)}%), ${(rate / 2 ** 20).toFixed(0)} MiB/s, ~${eta} min left`);
+			const message = `${label}: ${gib(doneBytes)} / ${gib(total)} (${(100 * doneBytes / total).toFixed(1)}%), ${(rate / 2 ** 20).toFixed(0)} MiB/s, ~${eta} min left`;
+			if (label === 'verify') verificationLog(message);
+			else log(message);
 		},
 	};
 }
@@ -459,37 +467,17 @@ async function patchDepot(client, game, job) {
 		if (fs.existsSync(full)) fs.unlinkSync(full);
 	}
 	await stash.close();
-	log(`depot ${job.depot}: patch written (${fallbacks} chunks re-downloaded on the fly). Verifying...`);
-	const bad = await verifyDepot(game, job, dl);
-	if (bad) {
-		const again = await verifyDepot(game, job, dl, true);
-		if (again) throw new Error(`depot ${job.depot}: ${again} chunks still wrong after repair`);
-	}
-	// stash and checkpoint are no longer needed
-	fs.rmSync(job.dir, {recursive: true, force: true});
+	log(`depot ${job.depot}: patch written (${fallbacks} chunks re-downloaded on the fly).`);
 }
 
 async function verifyDepot(game, job, dl, quiet) {
 	const prog = quiet ? {add() {}} : progress('verify', verifyBytes(job));
-	let bad = 0;
-	for (const f of job.plan.files) {
-		const fh = await fsp.open(path.join(game.dir, f.filename), 'r+');
-		const {size} = await fh.stat();
-		if (size !== f.size) await fh.truncate(f.size);
-		for (const op of f.ops) {
-			const buf = await readAt(fh, op.offset, op.len);
-			if (sha1(buf) !== op.sha) {
-				bad++;
-				const data = await dl.chunk(op.sha);
-				await fh.write(data, 0, data.length, op.offset);
-			}
-			prog.add(op.len);
-		}
-		await fh.sync();
-		await fh.close();
-	}
-	log(bad ? `depot ${job.depot}: verify repaired ${bad} chunks` : `depot ${job.depot}: verify OK, every changed file matches the new build`);
-	return bad;
+	const result = await verifyFiles({directory: game.dir, files: job.plan.files,
+		readAt, download: sha => dl.chunk(sha), progress: prog, shouldSkip: gui.skipVerification});
+	verificationLog(result.skipped ? `depot ${job.depot}: verification skipped` : result.bad
+		? `depot ${job.depot}: verify repaired ${result.bad} chunks`
+		: `depot ${job.depot}: verify OK, every changed file matches the new build`);
+	return result;
 }
 
 // ---------- Steam app manifest ----------
@@ -544,8 +532,27 @@ async function update(client, app) {
 		jobs.reduce((s, j) => s + verifyBytes(j), 0),
 	);
 	for (const job of jobs) await patchDepot(client, game, job);
+	log('Download and patching complete.');
+	gui.setVerification({active: true});
+	try {
+		for (const job of jobs) {
+			if (gui.skipVerification()) break;
+			const dl = new Downloader(client, game.app, job.depot);
+			const result = await verifyDepot(game, job, dl);
+			if (result.skipped) break;
+			if (result.bad) {
+				const again = await verifyDepot(game, job, dl, true);
+				if (again.skipped) break;
+				if (again.bad) throw new Error(`depot ${job.depot}: ${again.bad} chunks still wrong after repair`);
+			}
+		}
+	} finally {
+		gui.setVerification({active: false});
+	}
+	gui.setVerification({message: gui.skipVerification() ? 'Verification skipped' : 'Verification complete'});
 	fixAcf(game, jobs, buildid);
-	log(`Done: ${game.name} is on build ${buildid}. Start Steam; optionally run Properties > Installed Files > Verify integrity once.`);
+	for (const job of jobs) fs.rmSync(job.dir, {recursive: true, force: true});
+	log(`Done: ${game.name} is on build ${buildid}.${gui.skipVerification() ? ' Verification skipped.' : ''} Start Steam; optionally run Properties > Installed Files > Verify integrity once.`);
 }
 
 (async () => {

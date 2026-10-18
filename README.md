@@ -31,7 +31,7 @@ For the ARK update that meant downloading 7.3 GB and needing **~10 GB** of free 
 - SHA-1 verification with automatic repair
 - QR login via the Steam mobile app, so you never type your password into the tool
 - Single `.exe`, no install needed; finds all your Steam libraries
-- Progress page in your browser with one bar: download and installing
+- Progress page with one bar for downloading and patching; optional verification shown separately below, with a skip button
 
 ## Usage
 
