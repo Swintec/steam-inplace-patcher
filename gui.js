@@ -36,6 +36,7 @@ button:disabled{opacity:.5;cursor:default}
 .hint{font-size:13px;color:var(--muted)}
 .verification{margin-top:16px;font-size:12px;color:var(--muted)}
 .verification button{font-size:12px;padding:4px 8px;margin-left:8px;background:transparent;color:var(--muted);border:1px solid var(--line)}
+.support{margin-top:20px;font-size:12px;color:var(--muted)}.support a{color:inherit}
 .bar{display:flex;height:22px;border-radius:11px;background:var(--track);overflow:hidden}
 .seg{height:100%;transition:width .4s}.dl{background:var(--dl)}.inst{background:var(--inst)}
 .legend{display:flex;justify-content:space-between;margin-top:10px;font-size:13px;color:var(--muted);gap:12px;flex-wrap:wrap}
@@ -57,6 +58,7 @@ button:disabled{opacity:.5;cursor:default}
  <span><span class="dot" style="background:var(--inst)"></span>Patching <b id="linst"></b></span></div>
  <div id="verification" class="verification hide"><span id="verifytext"></span><button id="skipverify">Skip verification</button></div>
 </div>
+<div class="support">Saved you some disk space? <a href="https://buymeacoffee.com/swintec" target="_blank" rel="noopener noreferrer">☕ Buy me a coffee</a></div>
 </div><script>
 const $=id=>document.getElementById(id);
 const g=n=>(n/2**30).toFixed(2)+' GB';

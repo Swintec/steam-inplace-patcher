@@ -3,6 +3,8 @@
 Update huge Steam games **in place**, without needing free space for a full staging copy.
 Originally built for ARK: Survival Ascended and its 191 GB pak file; works for any Steam game.
 
+[☕ Buy me a coffee](https://buymeacoffee.com/swintec) — Saved you some disk space? Support the project.
+
 ## The problem
 
 Steam updates a game by building a complete new copy of every changed file before it swaps the copy in.
