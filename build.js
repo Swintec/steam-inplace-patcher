@@ -2,6 +2,14 @@
 const fs = require('fs');
 const {execSync} = require('child_process');
 
+// The exe embeds the Node running this script. steam-crypto's synchronous
+// end()/read() calls return incomplete data with Node 26's stream behavior.
+if (Number(process.versions.node.split('.')[0]) !== 24) {
+	throw new Error(`Build requires Node.js 24 LTS; found ${process.version}. Run: npx --yes --package=node@24 node build.js`);
+}
+// Check real encrypted/compressed chunk round trips before producing an exe.
+execSync('"' + process.execPath + '" test-cdn-crypto.js', {stdio: 'inherit'});
+
 (async () => {
 await require('esbuild').build({
 	entryPoints: ['patcher.js'],

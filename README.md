@@ -59,10 +59,21 @@ reporting a download failure. Login tokens and QR codes are not recorded.
 
 ### Build from source
 
+Use **Node.js 24 LTS**. The build embeds your Node runtime in the exe.
+Node 26 is incompatible with the Steam library's crypto stream handling and can
+truncate decrypted chunks, causing missing Zstd footers. The build checks the
+Node version and runs an encrypted chunk regression check before packaging.
+
 ```bash
 npm install
 node build.js            # creates dist/steam-inplace-patcher.exe
 node test-schedule.js    # randomized test of the in-place write ordering
+```
+
+If another Node version is installed, build with:
+
+```bash
+npx --yes --package=node@24 node build.js
 ```
 
 ## When it helps
