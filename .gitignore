@@ -3,3 +3,4 @@ dist/
 state/
 sea-config.json
 demo.log
+debug-*.log

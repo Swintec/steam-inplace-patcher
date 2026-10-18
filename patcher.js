@@ -14,9 +14,16 @@ const {execSync} = require('child_process');
 const {loadManifest, buildPlan, schedule} = require('./plan.js');
 const gui = require('./gui.js');
 
-const STEAM = findSteam();
 // as a single .exe, keep state next to the exe
 const HERE = require('node:sea').isSea() ? path.dirname(process.execPath) : __dirname;
+const debug = require('./debug.js').createDebug(process.argv.slice(2), HERE);
+if (debug.enabled) {
+	console.log('Debug log:', debug.file);
+	debug.write('startup', {node: process.version, platform: process.platform, arch: process.arch, sea: require('node:sea').isSea()});
+	debug.instrumentCompression(require('steam-user/components/cdn_compression.js'));
+	process.on('warning', e => debug.error('warning', e));
+}
+const STEAM = findSteam();
 const STATE = path.join(HERE, 'state');
 const TOKEN = path.join(STATE, 'refresh-token.txt');
 
@@ -25,6 +32,7 @@ const gib = n => (n / 2 ** 30).toFixed(2) + ' GiB';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = (...a) => {
 	console.log(new Date().toLocaleTimeString(), ...a);
+	debug.write('message', {message: a.join(' ')});
 	gui.set({message: a.join(' ')});
 };
 
@@ -153,7 +161,10 @@ function progress(label, total) {
 async function login() {
 	const SteamUser = require('steam-user');
 	const client = new SteamUser({enablePicsCache: false, autoRelogin: true});
-	client.on('error', e => log('Steam error:', e.message));
+	client.on('error', e => {
+		debug.error('steam-error', e);
+		log('Steam error:', e.message);
+	});
 
 	let refreshToken = fs.existsSync(TOKEN) ? fs.readFileSync(TOKEN, 'utf8').trim() : null;
 	if (!refreshToken) refreshToken = await qrLogin();
@@ -293,10 +304,17 @@ class Downloader {
 		let lastErr;
 		for (let attempt = 0; attempt < 8; attempt++) {
 			const server = this.servers[this.next++ % this.servers.length];
+			const details = {app: this.app, depot: this.depot, sha, attempt: attempt + 1,
+				server: server.Host, vhost: server.vhost, https: server.https_support};
+			const started = Date.now();
+			debug.write('chunk-start', details);
 			try {
-				const {chunk} = await this.client.downloadChunk(this.app, this.depot, sha, server);
+				const {chunk} = await debug.run(details, () => this.client.downloadChunk(this.app, this.depot, sha, server));
+				debug.write('chunk-complete', {...details, bytes: chunk.length, elapsedMs: Date.now() - started});
 				return chunk;
 			} catch (e) {
+				debug.error('chunk-failed', e, {...details, elapsedMs: Date.now() - started});
+				if (debug.enabled) console.error(`[debug] chunk ${sha}, attempt ${attempt + 1}/8, server ${server.Host}: ${e.message}`);
 				lastErr = e;
 				await sleep(500 * (attempt + 1));
 			}
@@ -531,7 +549,7 @@ async function update(client, app) {
 }
 
 (async () => {
-	const [cmd = 'gui', arg] = process.argv.slice(2);
+	const [cmd = 'gui', arg] = debug.argv;
 	fs.mkdirSync(STATE, {recursive: true});
 
 	if (cmd === 'gui') {
@@ -547,6 +565,7 @@ async function update(client, app) {
 			client.logOff();
 			gui.set({finished: true});
 		} catch (e) {
+			debug.error('fatal', e);
 			console.error('\nERROR:', e.message);
 			gui.set({error: e.message});
 		}
@@ -559,7 +578,7 @@ async function update(client, app) {
 		return process.exit(0);
 	}
 	if (!['plan', 'apply', 'verify'].includes(cmd) || !/^\d+$/.test(arg || '')) {
-		console.log('usage: node patcher.js [gui] | list | plan <appid> | apply <appid> | verify <appid>');
+		console.log('usage: node patcher.js [gui] | list | plan <appid> | apply <appid> | verify <appid> [-debug]');
 		return process.exit(1);
 	}
 	const app = Number(arg);
@@ -580,6 +599,7 @@ async function update(client, app) {
 	client.logOff();
 	setTimeout(() => process.exit(0), 1000);
 })().catch(e => {
+	debug.error('fatal', e);
 	console.error('\nERROR:', e.message);
 	process.exit(1);
 });

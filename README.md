@@ -49,7 +49,13 @@ steam-inplace-patcher.exe list             # installed games and app IDs
 steam-inplace-patcher.exe plan 2399830     # offline: what would change
 steam-inplace-patcher.exe apply 2399830    # update a game in place
 steam-inplace-patcher.exe verify 2399830   # check changed files, repair mismatches
+steam-inplace-patcher.exe -debug           # browser UI with download diagnostics
 ```
+
+Add `-debug` (or `--debug`) anywhere in the command to write a timestamped
+`debug-*.log` next to the exe. It records download servers, each chunk attempt,
+timings, decompression frame metadata and full error stacks. Share that log when
+reporting a download failure. Login tokens and QR codes are not recorded.
 
 ### Build from source
 
