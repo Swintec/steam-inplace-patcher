@@ -1,15 +1,27 @@
-// Builds dist/ark-patcher.exe (Node single executable application).
+// Builds dist/steam-inplace-patcher.exe (Node single executable application).
 const fs = require('fs');
 const {execSync} = require('child_process');
 
-require('esbuild').buildSync({
+(async () => {
+await require('esbuild').build({
 	entryPoints: ['patcher.js'],
 	bundle: true,
 	platform: 'node',
 	target: 'node24',
 	outfile: 'dist/bundle.js',
 	logLevel: 'warning',
-	plugins: [],
+	plugins: [{
+		// steam-user picks its LZMA library at runtime, which a bundle can't follow; pin the pure-JS one
+		name: 'pin-lzma',
+		setup(b) {
+			b.onLoad({filter: /cdn_compression\.js$/}, args => ({
+				loader: 'js',
+				contents: fs.readFileSync(args.path, 'utf8').replace(
+					"requireWithFallback('lzma-native', 'lzma')",
+					"require('lzma/src/lzma_worker.js').LZMA_WORKER"),
+			}));
+		},
+	}],
 });
 // steam-crypto reads its public key from disk at load time; inline it
 const pem = fs.readFileSync('node_modules/@doctormckay/steam-crypto/system.pem', 'utf8');
@@ -21,5 +33,6 @@ fs.writeFileSync('dist/bundle.js', js);
 
 fs.writeFileSync('sea-config.json', JSON.stringify({main: 'dist/bundle.js', output: 'dist/sea.blob', disableExperimentalSEAWarning: true}));
 execSync('node --experimental-sea-config sea-config.json', {stdio: 'inherit'});
-fs.copyFileSync(process.execPath, 'dist/ark-patcher.exe');
-execSync('npx postject dist/ark-patcher.exe NODE_SEA_BLOB dist/sea.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2', {stdio: 'inherit'});
+fs.copyFileSync(process.execPath, 'dist/steam-inplace-patcher.exe');
+execSync('npx postject dist/steam-inplace-patcher.exe NODE_SEA_BLOB dist/sea.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2', {stdio: 'inherit'});
+})();

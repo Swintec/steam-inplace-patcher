@@ -1,10 +1,11 @@
-// In-place updater for ARK: Survival Ascended (app 2399830, depot 2399831).
-// Rewrites changed files in place instead of staging a full copy, so it needs ~10 GB free instead of ~210 GB.
+// In-place updater for Steam games.
+// Rewrites changed files in place instead of staging a full copy, so a huge game needs a few GB free instead of its full size.
 //
-//   node patcher.js plan      offline: what would change
-//   node patcher.js apply     log in, download new chunks, patch in place, verify (Steam must be closed)
-//   node patcher.js verify    log in, check every changed file chunk by chunk and repair mismatches
-//   node patcher.js fixacf    tell Steam the game is on the new build (Steam must be closed)
+//   steam-inplace-patcher.exe                 pick a game in the browser and update it
+//   node patcher.js plan   <appid>            offline: what would change
+//   node patcher.js apply  <appid>            log in, download new chunks, patch in place, verify, update Steam's app manifest
+//   node patcher.js verify <appid>            check every changed file chunk by chunk and repair mismatches
+//   node patcher.js list                      installed games
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -13,14 +14,19 @@ const {execSync} = require('child_process');
 const {loadManifest, buildPlan, schedule} = require('./plan.js');
 const gui = require('./gui.js');
 
-const APP = 2399830;
-const DEPOT = 2399831;
 const STEAM = findSteam();
-const LIB = findLibrary();   // the Steam library folder that holds ASA
-const ACF = `${LIB}\\steamapps\\appmanifest_${APP}.acf`;
-const GAME = `${LIB}\\steamapps\\common\\ARK Survival Ascended`;
 // as a single .exe, keep state next to the exe
 const HERE = require('node:sea').isSea() ? path.dirname(process.execPath) : __dirname;
+const STATE = path.join(HERE, 'state');
+const TOKEN = path.join(STATE, 'refresh-token.txt');
+
+const sha1 = buf => crypto.createHash('sha1').update(buf).digest('hex');
+const gib = n => (n / 2 ** 30).toFixed(2) + ' GiB';
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const log = (...a) => {
+	console.log(new Date().toLocaleTimeString(), ...a);
+	gui.set({message: a.join(' ')});
+};
 
 function findSteam() {
 	try {
@@ -31,30 +37,74 @@ function findSteam() {
 	return 'C:\\Program Files (x86)\\Steam';
 }
 
-function findLibrary() {
+function libraries() {
 	const vdf = `${STEAM}\\steamapps\\libraryfolders.vdf`;
 	const libs = fs.existsSync(vdf) ? [...fs.readFileSync(vdf, 'utf8').matchAll(/"path"\s+"([^"]+)"/g)].map(m => m[1].replace(/\\\\/g, '\\')) : [];
-	return [STEAM, ...libs].find(l => fs.existsSync(`${l}\\steamapps\\appmanifest_${APP}.acf`)) || STEAM;
+	const seen = new Set();
+	return [STEAM, ...libs].filter(l => {
+		const k = l.toLowerCase();
+		if (seen.has(k)) return false;
+		seen.add(k);
+		return fs.existsSync(`${l}\\steamapps`);
+	});
 }
-const STATE = path.join(HERE, 'state');
-const STASH = path.join(STATE, 'stash.bin');
-const STASH_INDEX = path.join(STATE, 'stash-index.json');
-const CHECKPOINT = path.join(STATE, 'checkpoint.json');
-const TOKEN = path.join(STATE, 'refresh-token.txt');
 
-const sha1 = buf => crypto.createHash('sha1').update(buf).digest('hex');
-const gib = n => (n / 2 ** 30).toFixed(2) + ' GiB';
-const log = (...a) => {
-	console.log(new Date().toLocaleTimeString(), ...a);
-	gui.set({message: a.join(' ')});
-};
+// ---------- installed games / app manifests ----------
 
-function readAcf() {
-	const text = fs.readFileSync(ACF, 'utf8');
+function parseAcf(file) {
+	const text = fs.readFileSync(file, 'utf8');
 	const field = name => (text.match(new RegExp(`"${name}"\\s+"([^"]*)"`)) || [])[1];
-	const depotBlock = text.match(new RegExp(`"${DEPOT}"\\s*\\{\\s*"manifest"\\s+"(\\d+)"`));
-	return {text, buildid: field('buildid'), target: field('TargetBuildID'), manifest: depotBlock && depotBlock[1]};
+	const depots = [];
+	const block = text.match(/"InstalledDepots"\s*\{([\s\S]*?)\n\t\}/);
+	if (block) {
+		for (const m of block[1].matchAll(/"(\d+)"\s*\{\s*"manifest"\s+"(\d+)"\s*"size"\s+"(\d+)"/g)) {
+			depots.push({depot: Number(m[1]), manifest: m[2], size: Number(m[3])});
+		}
+	}
+	const beta = (text.match(/"UserConfig"\s*\{[^}]*?"BetaKey"\s+"([^"]*)"/) || [])[1];
+	return {
+		text, file, depots,
+		app: Number(field('appid')),
+		name: field('name'),
+		installdir: field('installdir'),
+		buildid: field('buildid'),
+		target: field('TargetBuildID'),
+		stateFlags: Number(field('StateFlags') || 0),
+		sizeOnDisk: Number(field('SizeOnDisk') || 0),
+		branch: beta || 'public',
+	};
 }
+
+function listGames() {
+	const games = [];
+	for (const lib of libraries()) {
+		for (const n of fs.readdirSync(`${lib}\\steamapps`).filter(n => /^appmanifest_\d+\.acf$/.test(n))) {
+			try {
+				const a = parseAcf(`${lib}\\steamapps\\${n}`);
+				if (!a.depots.length) continue;
+				games.push({
+					app: a.app, name: a.name, lib, gb: +(a.sizeOnDisk / 2 ** 30).toFixed(1),
+					// StateFlags bit 2 = update required (Steam already knows about a newer build)
+					updatePending: !!(a.stateFlags & 2) || (a.target && a.target !== '0' && a.target !== a.buildid),
+				});
+			} catch (e) {}
+		}
+	}
+	return games.sort((a, b) => (b.updatePending - a.updatePending) || b.gb - a.gb);
+}
+
+function openGame(app) {
+	for (const lib of libraries()) {
+		const file = `${lib}\\steamapps\\appmanifest_${app}.acf`;
+		if (fs.existsSync(file)) {
+			const acf = parseAcf(file);
+			return {...acf, lib, dir: `${lib}\\steamapps\\common\\${acf.installdir}`, state: path.join(STATE, String(app))};
+		}
+	}
+	throw new Error(`App ${app} is not installed in any Steam library`);
+}
+
+// ---------- Steam process ----------
 
 function steamRunning() {
 	try {
@@ -64,13 +114,30 @@ function steamRunning() {
 	}
 }
 
+// Steam must not touch the game (or its app manifest) while we patch
+async function closeSteam() {
+	if (!steamRunning()) return;
+	log('Closing Steam...');
+	try {
+		execSync(`"${STEAM}\\steam.exe" -shutdown`, {stdio: 'ignore', timeout: 15000});
+	} catch (e) {}
+	for (let i = 0; i < 30 && steamRunning(); i++) await sleep(1000);
+	if (steamRunning()) {
+		log('Steam did not exit in time, forcing it to close...');
+		try { execSync('taskkill /F /IM steam.exe', {stdio: 'ignore'}); } catch (e) {}
+		for (let i = 0; i < 10 && steamRunning(); i++) await sleep(1000);
+	}
+	if (steamRunning()) throw new Error('Could not close Steam; exit it via the tray icon and start again');
+	await sleep(2000);
+}
+
 function progress(label, total) {
 	let doneBytes = 0, last = 0;
 	const start = Date.now();
 	return {
 		add(n) {
 			doneBytes += n;
-			gui.progress(label, doneBytes);
+			gui.add(label, n);
 			const now = Date.now();
 			if (now - last < 3000 && doneBytes < total) return;
 			last = now;
@@ -125,38 +192,43 @@ async function qrLogin() {
 
 // ---------- manifests ----------
 
-async function getManifests(client) {
-	const acf = readAcf();
-	let newId, buildid;
+// latest manifest id per installed depot, from Steam (online) or the newest one in depotcache (offline)
+async function latestManifests(client, game) {
+	const latest = new Map();
+	let buildid = game.target;
 	if (client) {
-		const {apps} = await client.getProductInfo([APP], [], true);
-		const info = apps[APP].appinfo;
-		const m = info.depots[DEPOT].manifests.public;
-		newId = typeof m === 'object' ? m.gid : m;
-		buildid = info.depots.branches.public.buildid;
-		log(`Installed build ${acf.buildid} (manifest ${acf.manifest}), latest build ${buildid} (manifest ${newId})`);
+		const {apps} = await client.getProductInfo([game.app], [], true);
+		const info = apps[game.app] && apps[game.app].appinfo;
+		if (!info || !info.depots) throw new Error(`No depot info for app ${game.app}; do you own it?`);
+		const branch = info.depots.branches && info.depots.branches[game.branch];
+		if (!branch) throw new Error(`Branch "${game.branch}" not found for app ${game.app}`);
+		buildid = branch.buildid;
+		for (const d of game.depots) {
+			const m = info.depots[d.depot] && info.depots[d.depot].manifests && info.depots[d.depot].manifests[game.branch];
+			if (m) latest.set(d.depot, typeof m === 'object' ? m.gid : m);
+		}
+		log(`${game.name}: installed build ${game.buildid}, latest build ${buildid}${game.branch !== 'public' ? ` (branch ${game.branch})` : ''}`);
 	} else {
-		// offline: assume the newest manifest Steam already fetched is the target
-		const cands = fs.readdirSync(`${STEAM}\\depotcache`).filter(n => n.startsWith(`${DEPOT}_`));
-		newId = cands.map(n => [n, fs.statSync(`${STEAM}\\depotcache\\${n}`).mtimeMs]).sort((a, b) => b[1] - a[1])[0][0].slice(String(DEPOT).length + 1, -9);
-		buildid = acf.target;
+		const cache = `${STEAM}\\depotcache`;
+		const files = fs.existsSync(cache) ? fs.readdirSync(cache) : [];
+		for (const d of game.depots) {
+			const newest = files.filter(n => n.startsWith(`${d.depot}_`))
+				.map(n => [n, fs.statSync(`${cache}\\${n}`).mtimeMs]).sort((a, b) => b[1] - a[1])[0];
+			if (newest) latest.set(d.depot, newest[0].slice(String(d.depot).length + 1, -9));
+		}
 	}
-	if (newId === acf.manifest) throw new Error('Already on the latest manifest, nothing to do');
-
-	const oldM = await fetchManifest(client, acf.manifest);
-	const newM = await fetchManifest(client, newId);
-	return {oldM, newM, newId, buildid};
+	return {latest, buildid};
 }
 
-// from Steam's depotcache when present, else from the CDN (cached in state\)
-async function fetchManifest(client, id) {
-	let file = `${STEAM}\\depotcache\\${DEPOT}_${id}.manifest`;
+// from Steam's depotcache when present, else from the CDN (cached in state\<app>)
+async function fetchManifest(client, game, depot, id) {
+	let file = `${STEAM}\\depotcache\\${depot}_${id}.manifest`;
 	if (!fs.existsSync(file)) {
-		file = path.join(STATE, `${DEPOT}_${id}.manifest`);
+		file = path.join(game.state, `${depot}_${id}.manifest`);
 		if (!fs.existsSync(file)) {
-			if (!client) throw new Error(`Manifest ${id} not cached locally; run apply to download it`);
-			log(`Downloading manifest ${id}...`);
-			const {manifest} = await client.getRawManifest(APP, DEPOT, id, 'public');
+			if (!client) throw new Error(`Manifest ${depot}_${id} not cached locally; run apply to download it`);
+			log(`Downloading manifest ${depot}_${id}...`);
+			const {manifest} = await client.getRawManifest(game.app, depot, id, game.branch);
 			fs.writeFileSync(file, manifest);
 		}
 	}
@@ -166,7 +238,7 @@ async function fetchManifest(client, id) {
 		// downloaded manifests have encrypted filenames
 		const ContentManifest = require('steam-user/components/content_manifest.js');
 		const m = ContentManifest.parse(fs.readFileSync(file));
-		ContentManifest.decryptFilenames(m, (await client.getDepotDecryptionKey(APP, DEPOT)).key);
+		ContentManifest.decryptFilenames(m, (await client.getDepotDecryptionKey(game.app, depot)).key);
 		return normalize(m);
 	}
 }
@@ -181,54 +253,78 @@ function normalize(m) {
 	return m;
 }
 
-function summary(plan, sched) {
-	const t = plan.totals;
-	log(`${t.changedFiles} changed files, ${t.unchangedFiles} unchanged`);
-	log(`already in place ${gib(t.keep)}, to shift within the files ${gib(t.move)}, to download ${gib(t.download)} (${gib(t.downloadCompressed)} over the network)`);
-	log(`extra space needed: ~${gib(t.download + sched.stashBytes)} for downloaded chunks`);
-	if (plan.deleted.length) log('files to delete:', plan.deleted.join(', '));
+// one entry per depot that has a newer manifest
+async function prepare(client, game) {
+	fs.mkdirSync(game.state, {recursive: true});
+	const {latest, buildid} = await latestManifests(client, game);
+	const jobs = [];
+	for (const d of game.depots) {
+		const newId = latest.get(d.depot);
+		if (!newId || newId === d.manifest) continue;
+		const oldM = await fetchManifest(client, game, d.depot, d.manifest);
+		const newM = await fetchManifest(client, game, d.depot, newId);
+		const plan = buildPlan(oldM, newM);
+		const sched = schedule(plan);
+		const dir = path.join(game.state, String(d.depot));
+		fs.mkdirSync(dir, {recursive: true});
+		jobs.push({depot: d.depot, oldId: d.manifest, newId, newM, plan, sched, dir});
+	}
+	return {jobs, buildid};
 }
+
+function summary(job) {
+	const t = job.plan.totals;
+	log(`depot ${job.depot}: ${t.changedFiles} changed files, ${t.unchangedFiles} unchanged`);
+	log(`depot ${job.depot}: already in place ${gib(t.keep)}, to shift within the files ${gib(t.move)}, to download ${gib(t.download)} (${gib(t.downloadCompressed)} over the network)`);
+	if (job.plan.deleted.length) log(`depot ${job.depot}: files to delete:`, job.plan.deleted.join(', '));
+}
+
+const patchBytes = job => job.sched.steps.reduce((s, x) => s + (x.stash ? 0 : x.op.len), 0);
+const verifyBytes = job => job.plan.files.reduce((s, f) => s + f.size, 0);
 
 // ---------- downloading ----------
 
 class Downloader {
-	constructor(client) {
-		this.client = client;
-		this.servers = null;
-		this.next = 0;
+	constructor(client, app, depot) {
+		Object.assign(this, {client, app, depot, servers: null, next: 0});
 	}
 	async chunk(sha) {
-		if (!this.servers) this.servers = (await this.client.getContentServers(APP)).servers;
+		if (!this.servers) this.servers = (await this.client.getContentServers(this.app)).servers;
 		let lastErr;
 		for (let attempt = 0; attempt < 8; attempt++) {
 			const server = this.servers[this.next++ % this.servers.length];
 			try {
-				const {chunk} = await this.client.downloadChunk(APP, DEPOT, sha, server);
+				const {chunk} = await this.client.downloadChunk(this.app, this.depot, sha, server);
 				return chunk;
 			} catch (e) {
 				lastErr = e;
-				await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+				await sleep(500 * (attempt + 1));
 			}
 		}
 		throw new Error(`chunk ${sha} failed: ${lastErr && lastErr.message}`);
 	}
 }
 
+// chunks to download, deduplicated; the same chunk can be needed at several places
+const downloadList = job => [...new Map(job.sched.ops.filter(o => o.type === 'download').map(o => [o.sha, o])).values()];
+
 // Downloads every new chunk into the stash before the game files are touched. Resumable.
-async function downloadAll(dl, ops) {
-	let index = fs.existsSync(STASH_INDEX) ? JSON.parse(fs.readFileSync(STASH_INDEX, 'utf8')) : {};
+async function downloadAll(dl, job) {
+	const stashFile = path.join(job.dir, `stash-${job.newId}.bin`);
+	const indexFile = path.join(job.dir, `stash-${job.newId}.json`);
+	const index = fs.existsSync(indexFile) ? JSON.parse(fs.readFileSync(indexFile, 'utf8')) : {};
 	let end = Object.values(index).reduce((m, e) => Math.max(m, e.pos + e.len), 0);
-	const fh = await fsp.open(STASH, fs.existsSync(STASH) ? 'r+' : 'w+');
+	const fh = await fsp.open(stashFile, fs.existsSync(stashFile) ? 'r+' : 'w+');
 	await fh.truncate(end);
 
-	// the same chunk can be needed at several places; download it once
-	const todo = [...new Map(ops.filter(o => o.type === 'download' && !index[o.sha]).map(o => [o.sha, o])).values()];
+	const all = downloadList(job);
+	const todo = all.filter(o => !index[o.sha]);
+	gui.add('download', all.reduce((s, o) => s + o.compressed, 0) - todo.reduce((s, o) => s + o.compressed, 0));
 	const total = todo.reduce((s, o) => s + o.compressed, 0);
-	log(`Downloading ${todo.length} chunks (${gib(total)}), ${Object.keys(index).length} already in the stash`);
-	gui.set({dl: {done: 0, total}});
+	log(`depot ${job.depot}: downloading ${todo.length} chunks (${gib(total)}), ${Object.keys(index).length} already in the stash`);
 	const prog = progress('download', total);
 	let i = 0, sinceSave = 0;
-	const save = () => fs.writeFileSync(STASH_INDEX, JSON.stringify(index));
+	const save = () => fs.writeFileSync(indexFile, JSON.stringify(index));
 	const worker = async () => {
 		while (i < todo.length) {
 			const op = todo[i++];
@@ -253,10 +349,10 @@ async function downloadAll(dl, ops) {
 
 // ---------- patching ----------
 
-async function openGameFile(name, handles) {
+async function openGameFile(game, name, handles) {
 	const k = name.toLowerCase();
 	if (handles.has(k)) return handles.get(k);
-	const full = path.join(GAME, name);
+	const full = path.join(game.dir, name);
 	await fsp.mkdir(path.dirname(full), {recursive: true});
 	const fh = await fsp.open(full, fs.existsSync(full) ? 'r+' : 'w+');
 	handles.set(k, fh);
@@ -274,18 +370,10 @@ async function readAt(fh, pos, len) {
 	return got === len ? buf : buf.subarray(0, got);
 }
 
-async function apply(client) {
-	if (steamRunning()) throw new Error('Close Steam completely first (Steam > Exit), then run again');
-	fs.mkdirSync(STATE, {recursive: true});
-	const {oldM, newM} = await getManifests(client);
-	const plan = buildPlan(oldM, newM);
-	const sched = schedule(plan);
-	summary(plan, sched);
-	const patchTotal = sched.steps.reduce((s, x) => s + (x.stash ? 0 : x.op.len), 0);
-	gui.setInstallTotals(patchTotal, plan.files.reduce((s, f) => s + f.size, 0));
-
-	const dl = new Downloader(client);
-	const {fh: stash, index} = await downloadAll(dl, sched.ops);
+async function patchDepot(client, game, job) {
+	const {plan, sched} = job;
+	const dl = new Downloader(client, game.app, job.depot);
+	const {fh: stash, index} = await downloadAll(dl, job);
 	const fromStash = async sha => {
 		const e = index[sha];
 		const buf = e && await readAt(stash, e.pos, e.len);
@@ -293,29 +381,32 @@ async function apply(client) {
 	};
 
 	const handles = new Map();
-	const fileByName = new Map(plan.files.map(f => [f.filename.toLowerCase(), f]));
 	// grow files first so every destination exists
 	for (const f of plan.files) {
-		const fh = await openGameFile(f.filename, handles);
+		const fh = await openGameFile(game, f.filename, handles);
 		const {size} = await fh.stat();
 		if (size < f.size) await fh.truncate(f.size);
 	}
 
-	const start = fs.existsSync(CHECKPOINT) ? JSON.parse(fs.readFileSync(CHECKPOINT, 'utf8')).step : 0;
-	if (start) log(`Resuming at step ${start} of ${sched.steps.length}`);
+	const checkpoint = path.join(job.dir, `checkpoint-${job.newId}.json`);
+	const start = fs.existsSync(checkpoint) ? JSON.parse(fs.readFileSync(checkpoint, 'utf8')).step : 0;
+	if (start) log(`depot ${job.depot}: resuming at step ${start} of ${sched.steps.length}`);
 	const memStash = new Map();
-	const total = sched.steps.reduce((s, x) => s + (x.stash ? 0 : x.op.len), 0);
-	const prog = progress('patch', total);
+	const prog = progress('patch', patchBytes(job));
 	let fallbacks = 0;
-	for (let n = start; n < sched.steps.length; n++) {
+	for (let n = 0; n < sched.steps.length; n++) {
 		const {op, stash: toStash, fromStash: useStash} = sched.steps[n];
+		if (n < start) {
+			if (!toStash) prog.add(op.len);
+			continue;
+		}
 		if (toStash) {
-			const src = await openGameFile(op.src.file, handles);
+			const src = await openGameFile(game, op.src.file, handles);
 			const buf = await readAt(src, op.src.offset, op.len);
 			if (sha1(buf) === op.sha) memStash.set(op.id, buf);
 			continue;
 		}
-		const dst = await openGameFile(op.file, handles);
+		const dst = await openGameFile(game, op.file, handles);
 		let data;
 		if (op.type === 'download') {
 			data = await fromStash(op.sha);
@@ -323,7 +414,7 @@ async function apply(client) {
 			data = memStash.get(op.id);
 			memStash.delete(op.id);
 		} else {
-			const src = await openGameFile(op.src.file, handles);
+			const src = await openGameFile(game, op.src.file, handles);
 			data = await readAt(src, op.src.offset, op.len);
 		}
 		if (!data || sha1(data) !== op.sha) {
@@ -336,36 +427,35 @@ async function apply(client) {
 		prog.add(op.len);
 		if (n % 2000 === 0) {
 			for (const h of handles.values()) await h.sync();
-			fs.writeFileSync(CHECKPOINT, JSON.stringify({step: n}));
+			fs.writeFileSync(checkpoint, JSON.stringify({step: n}));
 		}
 	}
 	for (const f of plan.files) {
-		const fh = await openGameFile(f.filename, handles);
+		const fh = await openGameFile(game, f.filename, handles);
 		await fh.truncate(f.size);
 	}
 	for (const h of handles.values()) { await h.sync(); await h.close(); }
-	fs.writeFileSync(CHECKPOINT, JSON.stringify({step: sched.steps.length}));
+	fs.writeFileSync(checkpoint, JSON.stringify({step: sched.steps.length}));
 	for (const name of plan.deleted) {
-		const full = path.join(GAME, name);
+		const full = path.join(game.dir, name);
 		if (fs.existsSync(full)) fs.unlinkSync(full);
 	}
 	await stash.close();
-	log(`Patch written (${fallbacks} chunks had to be re-downloaded on the fly). Verifying...`);
-	await verify(client, plan, dl);
+	log(`depot ${job.depot}: patch written (${fallbacks} chunks re-downloaded on the fly). Verifying...`);
+	const bad = await verifyDepot(game, job, dl);
+	if (bad) {
+		const again = await verifyDepot(game, job, dl, true);
+		if (again) throw new Error(`depot ${job.depot}: ${again} chunks still wrong after repair`);
+	}
+	// stash and checkpoint are no longer needed
+	fs.rmSync(job.dir, {recursive: true, force: true});
 }
 
-async function verify(client, plan, dl) {
-	if (!plan) {
-		const {oldM, newM} = await getManifests(client);
-		plan = buildPlan(oldM, newM);
-	}
-	dl = dl || new Downloader(client);
-	const newFiles = plan.files;
-	const total = newFiles.reduce((s, f) => s + f.size, 0);
-	const prog = progress('verify', total);
+async function verifyDepot(game, job, dl, quiet) {
+	const prog = quiet ? {add() {}} : progress('verify', verifyBytes(job));
 	let bad = 0;
-	for (const f of newFiles) {
-		const fh = await fsp.open(path.join(GAME, f.filename), 'r+');
+	for (const f of job.plan.files) {
+		const fh = await fsp.open(path.join(game.dir, f.filename), 'r+');
 		const {size} = await fh.stat();
 		if (size !== f.size) await fh.truncate(f.size);
 		for (const op of f.ops) {
@@ -380,56 +470,81 @@ async function verify(client, plan, dl) {
 		await fh.sync();
 		await fh.close();
 	}
-	log(bad ? `Verify repaired ${bad} chunks; run "verify" once more to confirm.` : 'Verify OK: every changed file matches the new build.');
+	log(bad ? `depot ${job.depot}: verify repaired ${bad} chunks` : `depot ${job.depot}: verify OK, every changed file matches the new build`);
 	return bad;
 }
 
 // ---------- Steam app manifest ----------
 
-async function fixAcf(client) {
-	if (steamRunning()) throw new Error('Close Steam completely first (Steam > Exit), then run again');
-	const {newM, newId, buildid} = await getManifests(client);
-	const acf = readAcf();
-	fs.mkdirSync(STATE, {recursive: true});
-	fs.writeFileSync(path.join(STATE, `appmanifest_${APP}.acf.bak`), acf.text);
-	const size = String(newM.files.reduce((s, f) => s + (f.flags & 64 ? 0 : f.size), 0));
+function fixAcf(game, jobs, buildid) {
+	const text = fs.readFileSync(game.file, 'utf8');
+	fs.writeFileSync(path.join(game.state, `appmanifest_${game.app}.acf.bak`), text);
 	const set = (t, k, v) => t.replace(new RegExp(`("${k}"\\s+")[^"]*(")`), `$1${v}$2`);
-	let t = acf.text;
+	let t = text;
+	let total = 0;
+	for (const d of game.depots) {
+		const job = jobs.find(j => j.depot === d.depot);
+		if (!job) { total += d.size; continue; }
+		const size = job.newM.files.reduce((s, f) => s + (f.flags & 64 ? 0 : f.size), 0);
+		total += size;
+		t = t.replace(new RegExp(`("${d.depot}"\\s*\\{\\s*"manifest"\\s+")\\d+("\\s*"size"\\s+")\\d+`), `$1${job.newId}$2${size}`);
+	}
 	for (const [k, v] of Object.entries({
-		StateFlags: '4', buildid, TargetBuildID: buildid, UpdateResult: '0', SizeOnDisk: size,
+		StateFlags: '4', buildid, TargetBuildID: buildid, UpdateResult: '0', SizeOnDisk: String(total),
 		BytesToDownload: '0', BytesDownloaded: '0', BytesToStage: '0', BytesStaged: '0',
 		LastUpdated: String(Math.floor(Date.now() / 1000)),
 	})) t = set(t, k, v);
-	t = t.replace(new RegExp(`("${DEPOT}"\\s*\\{\\s*"manifest"\\s+")\\d+("\\s*"size"\\s+")\\d+`), `$1${newId}$2${size}`);
-	fs.writeFileSync(ACF, t);
+	fs.writeFileSync(game.file, t);
 
-	// park leftover staging folders of the failed update so Steam doesn't resume it
-	const parked = path.join(STATE, 'parked-downloading');
-	fs.mkdirSync(parked, {recursive: true});
-	const dlDir = `${LIB}\\steamapps\\downloading`;
+	// park leftover staging folders of Steam's own attempt so it doesn't resume it
+	const parked = path.join(game.state, 'parked-downloading');
+	const dlDir = `${game.lib}\\steamapps\\downloading`;
 	for (const n of fs.existsSync(dlDir) ? fs.readdirSync(dlDir) : []) {
-		if (n === String(APP) || n.startsWith(`depot_${DEPOT}_`) || n.startsWith(`state_${APP}_`)) {
+		if (n === String(game.app) || n.startsWith(`state_${game.app}_`) || jobs.some(j => n.startsWith(`depot_${j.depot}_`))) {
+			fs.mkdirSync(parked, {recursive: true});
 			fs.renameSync(path.join(dlDir, n), path.join(parked, n));
 		}
 	}
-	log(`appmanifest updated to build ${buildid} / manifest ${newId} (backup in state\\). Start Steam, then Properties > Installed Files > Verify integrity.`);
+	log(`${game.name}: Steam app manifest updated to build ${buildid}`);
 }
 
-// ---------- main ----------
+// ---------- flows ----------
+
+async function update(client, app) {
+	const game = openGame(app);
+	await closeSteam();
+	const {jobs, buildid} = await prepare(client, game);
+	if (!jobs.length) {
+		log(`${game.name} is already up to date (build ${game.buildid}).`);
+		if (buildid && buildid !== game.buildid) fixAcf(game, [], buildid);
+		return;
+	}
+	jobs.forEach(summary);
+	gui.setTotals(
+		jobs.reduce((s, j) => s + downloadList(j).reduce((a, o) => a + o.compressed, 0), 0),
+		jobs.reduce((s, j) => s + patchBytes(j), 0),
+		jobs.reduce((s, j) => s + verifyBytes(j), 0),
+	);
+	for (const job of jobs) await patchDepot(client, game, job);
+	fixAcf(game, jobs, buildid);
+	log(`Done: ${game.name} is on build ${buildid}. Start Steam; optionally run Properties > Installed Files > Verify integrity once.`);
+}
 
 (async () => {
-	// double-clicked exe: run everything in one go
-	const cmd = process.argv[2] || 'all';
+	const [cmd = 'gui', arg] = process.argv.slice(2);
 	fs.mkdirSync(STATE, {recursive: true});
-	if (cmd === 'all') {
+
+	if (cmd === 'gui') {
+		// double-clicked exe: choose a game in the browser page
 		gui.start();
 		try {
-			if (steamRunning()) throw new Error('Close Steam completely first (right-click the tray icon > Exit), then start again');
+			gui.set({games: listGames(), message: 'Choose a game to update'});
+			const app = await gui.waitForChoice();
+			const game = openGame(app);
+			gui.set({title: `Updating ${game.name}`});
 			const client = await login();
-			await apply(client);
-			await fixAcf(client);
+			await update(client, app);
 			client.logOff();
-			log('Done. Start Steam and run Properties > Installed Files > Verify integrity once.');
 			gui.set({finished: true});
 		} catch (e) {
 			console.error('\nERROR:', e.message);
@@ -439,22 +554,29 @@ async function fixAcf(client) {
 		process.stdin.once('data', () => process.exit(0));
 		return;
 	}
-	if (cmd === 'plan') {
-		const {oldM, newM, newId} = await getManifests(null);
-		log(`Comparing installed manifest ${readAcf().manifest} with ${newId} (newest in depotcache)`);
-		const plan = buildPlan(oldM, newM);
-		summary(plan, schedule(plan));
+	if (cmd === 'list') {
+		for (const g of listGames()) console.log(String(g.app).padEnd(9), `${g.gb} GB`.padStart(9), g.updatePending ? ' update pending ' : '                ', g.name);
 		return process.exit(0);
 	}
-	if (!['apply', 'verify', 'fixacf'].includes(cmd)) {
-		console.log('usage: node patcher.js plan | apply | verify | fixacf');
+	if (!['plan', 'apply', 'verify'].includes(cmd) || !/^\d+$/.test(arg || '')) {
+		console.log('usage: node patcher.js [gui] | list | plan <appid> | apply <appid> | verify <appid>');
 		return process.exit(1);
 	}
-	if (cmd !== 'verify' && steamRunning()) throw new Error('Close Steam completely first (Steam > Exit), then run again');
+	const app = Number(arg);
+	if (cmd === 'plan') {
+		const game = openGame(app);
+		const {jobs} = await prepare(null, game);
+		if (!jobs.length) log(`${game.name}: no newer manifest in Steam's depotcache`);
+		jobs.forEach(summary);
+		return process.exit(0);
+	}
 	const client = await login();
-	if (cmd === 'apply') await apply(client);
-	if (cmd === 'verify') await verify(client);
-	if (cmd === 'fixacf') await fixAcf(client);
+	if (cmd === 'apply') await update(client, app);
+	if (cmd === 'verify') {
+		const game = openGame(app);
+		const {jobs} = await prepare(client, game);
+		for (const job of jobs) await verifyDepot(game, job, new Downloader(client, app, job.depot));
+	}
 	client.logOff();
 	setTimeout(() => process.exit(0), 1000);
 })().catch(e => {
